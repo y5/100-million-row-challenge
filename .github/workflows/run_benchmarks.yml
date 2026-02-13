@@ -42,13 +42,8 @@ jobs:
       - name: Determine branch + fetch ref
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "BRANCH=${{ github.head_ref }}" >> "$GITHUB_ENV"
-            echo "FETCH_REF=refs/pull/${{ github.event.pull_request.number }}/head" >> "$GITHUB_ENV"
-          else
-            echo "BRANCH=${{ github.ref_name }}" >> "$GITHUB_ENV"
-            echo "FETCH_REF=refs/heads/${{ github.ref_name }}" >> "$GITHUB_ENV"
-          fi
+          echo "BRANCH=pr-${{ inputs.pr_number }}" >> "$GITHUB_ENV"
+          echo "FETCH_REF=refs/pull/${{ inputs.pr_number }}/head" >> "$GITHUB_ENV"
 
       - name: Checkout code on server
         shell: bash
