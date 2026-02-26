@@ -380,6 +380,19 @@ final class BenchmarkRunCommand
             return;
         }
 
+        // Pull from main
+        $repoDir = __DIR__ . '/../..';
+
+        $gitPull = "cd " . escapeshellarg($repoDir) . " && git pull origin main";
+        $this->prLine($prNumber, $gitPull);
+        exec($gitPull, $output, $returnCode);
+
+        if ($returnCode !== 0) {
+            $this->prError($prNumber, "Git pull failed");
+            return;
+        }
+
+        // Update leaderboard
         $path = __DIR__ . '/../../leaderboard.csv';
         $handle = fopen($path, 'r');
         $data = [];
@@ -421,26 +434,35 @@ final class BenchmarkRunCommand
 
         file_put_contents($path, $leaderboard);
 
-        // Commit and push the leaderboard
-        $repoDir = __DIR__ . '/../..';
-
-        $gitCommand = "cd " . escapeshellarg($repoDir) . " && git pull origin main && git add leaderboard.csv";
-        $this->prLine($prNumber, $gitCommand);
-        exec($gitCommand, $output, $returnCode);
+        // Add changes
+        $gitAdd = "cd " . escapeshellarg($repoDir) . " && git add leaderboard.csv";
+        $this->prLine($prNumber, $gitAdd);
+        exec($gitAdd, $output, $returnCode);
 
         if ($returnCode !== 0) {
-            $this->prWarning($prNumber, "Leaderboard not updated");
+            $this->prWarning($prNumber, "Git add failed");
             return;
         }
 
-        exec("cd " . escapeshellarg($repoDir) . " && git commit -m 'Update leaderboard'", $output, $returnCode);
+        // Commit changes
+        $gitCommit = "cd " . escapeshellarg($repoDir) . " && git commit -m 'Update leaderboard'";
+        $this->prLine($prNumber, $gitCommit);
+        exec($gitCommit, $output, $returnCode);
 
         if ($returnCode !== 0) {
-            $this->prError($prNumber, "Leaderboard update failed");
+            $this->prError($prNumber, "Git commit failed");
             return;
         }
 
-        exec("cd " . escapeshellarg($repoDir) . " && git push", $output, $returnCode);
+        // Push changes
+        $gitPush = "cd " . escapeshellarg($repoDir) . " && git push";
+        $this->prLine($prNumber, $gitPush);
+        exec($gitPush, $output, $returnCode);
+
+        if ($returnCode !== 0) {
+            $this->prError($prNumber, "Git push failed");
+            return;
+        }
 
         $this->prSuccess($prNumber, "Leaderboard updated!");
     }
