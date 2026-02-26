@@ -91,7 +91,7 @@ Prizes are sponsored by [PhpStorm](https://www.jetbrains.com/phpstorm/) and [Tid
 
 All entries must be submitted before March 16, 2026 (so you have until March 15, 11:59PM CET to submit). Any entries submitted after the cutoff date won't be taken into account.
 
-**First place** will get:
+**🥇 First place** will get:
 
 - One PhpStorm Elephpant
 - One Tideways Elephpant
@@ -99,20 +99,20 @@ All entries must be submitted before March 16, 2026 (so you have until March 15,
 - Three-month JetBrains AI Ultimate license
 - One-year Tideways Team license
 
-**Second place** will get:
+**🥈 Second place** will get:
 
 - One PhpStorm Elephpant
 - One Tideways Elephpant
 - One-year JetBrains all-products pack license
 - Three-month JetBrains AI Ultimate license
 
-**Third place** will get:
+**🥉 Third place** will get:
 
 - One PhpStorm Elephpant
 - One Tideways Elephpant
 - One-year JetBrains all-products pack license
 
-Then, there are two more prizes to win: one for the **fastest single-core submission**, and one participation prize (a random winner picked from all entries). Both will get:
+Then, there are two more prizes to win: one for the **🚂 fastest single-core submission**, and one **🏅 participation prize** (a random winner picked from all entries). Both will get:
 
 - One PhpStorm Elephpant
 - One-year JetBrains all-products pack license
