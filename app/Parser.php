@@ -49,22 +49,19 @@ final class Parser
 
         $fileSize = filesize($inputPath);
 
-        // "YY-MM-DD" => integer ID for lookups
+        // Map every valid "YY-MM-DD" to a sequential integer
+        $dpm = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         $dateIds = [];
         $dateLabels = [];
         $dateCount = 0;
 
-        for ($y = 20; $y <= 26; $y++) {
-            for ($m = 1; $m <= 12; $m++) {
-                $maxD = match ($m) {
-                    2 => (($y + 2000) % 4 === 0) ? 29 : 28,
-                    4, 6, 9, 11 => 30,
-                    default => 31,
-                };
-                $mStr = ($m < 10 ? '0' : '') . $m;
-                $ymStr = $y . '-' . $mStr . '-';
-                for ($d = 1; $d <= $maxD; $d++) {
-                    $key = $ymStr . (($d < 10 ? '0' : '') . $d);
+        for ($year = 2020; $year <= 2026; $year++) {
+            $yy = $year - 2000;
+            for ($m = 0; $m < 12; $m++) {
+                $days = $dpm[$m] + ($m === 1 && $year % 4 === 0 ? 1 : 0);
+                $prefix = sprintf('%d-%02d-', $yy, $m + 1);
+                for ($d = 1; $d <= $days; $d++) {
+                    $key = $prefix . sprintf('%02d', $d);
                     $dateIds[$key] = $dateCount;
                     $dateLabels[$dateCount] = $key;
                     $dateCount++;
@@ -72,31 +69,31 @@ final class Parser
             }
         }
 
-        // We do a lil file probing business to get the slugs
-        // while preserving first-seen order
+        // Probe head of file to discover slugs in first-seen order
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
-        $raw = fread($handle, $fileSize > self::PROBE_SIZE ? self::PROBE_SIZE : $fileSize);
+        $probe = fread($handle, $fileSize > self::PROBE_SIZE ? self::PROBE_SIZE : $fileSize);
         fclose($handle);
 
         $slugBases = [];
         $slugLabels = [];
         $slugCount = 0;
-        $pos = 0;
-        $lastNl = strrpos($raw, "\n");
 
-        while ($pos < $lastNl) {
-            $nlPos = strpos($raw, "\n", $pos + 52);
-            if ($nlPos === false) break;
-            $slug = substr($raw, $pos + 25, $nlPos - $pos - 51);
+        // Trim to last complete line, then split and extract slug from each
+        $lines = explode("\n", substr($probe, 0, strrpos($probe, "\n")));
+        unset($probe);
+
+        foreach ($lines as $line) {
+            $comma = strpos($line, ',');
+            if ($comma === false) continue;
+            $slug = substr($line, 25, $comma - 25);
             if (!isset($slugBases[$slug])) {
                 $slugBases[$slug] = $slugCount * $dateCount;
                 $slugLabels[$slugCount] = $slug;
                 $slugCount++;
             }
-            $pos = $nlPos + 1;
         }
-        unset($raw);
+        unset($lines);
 
         foreach (Visit::all() as $visit) {
             $slug = substr($visit->uri, 25);
