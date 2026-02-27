@@ -8,8 +8,6 @@ use function array_fill;
 use function count;
 use function fclose;
 use function fgets;
-use function file_get_contents;
-use function file_put_contents;
 use function filesize;
 use function fopen;
 use function fread;
@@ -17,7 +15,6 @@ use function fseek;
 use function ftell;
 use function fwrite;
 use function gc_disable;
-use function getmypid;
 use function implode;
 use function ini_set;
 use function pack;
@@ -26,15 +23,16 @@ use function pcntl_wait;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
+use function stream_socket_pair;
 use function strlen;
 use function strpos;
 use function strrpos;
 use function substr;
-use function sys_get_temp_dir;
-use function unlink;
 use function unpack;
 
 use const SEEK_CUR;
+use const STREAM_PF_UNIX;
+use const STREAM_SOCK_STREAM;
 use const WNOHANG;
 
 final class Parser
@@ -157,30 +155,31 @@ final class Parser
 
         $gridSize = $slugCount * $dateCount * 2;
 
-        // Fork workers, IPC via shmop (or temp files as fallback)
-        $useShmop = \function_exists('shmop_open');
+        // Fork workers, IPC via Unix socket pairs
         $childMap = [];
 
         for ($w = 0; $w < $workers - 1; $w++) {
-            $handle = $useShmop
-                ? \shmop_open(0, 'c', 0600, $gridSize)
-                : sys_get_temp_dir() . '/p100m_' . getmypid() . '_' . $w;
+            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
 
             $pid = pcntl_fork();
             if ($pid === 0) {
+                fclose($pair[0]);
                 $wCounts = $this->parseRange(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
                     $slugBases, $dateIds, $slugCount, $dateCount,
                 );
                 $packed = pack('v*', ...$wCounts);
-                if ($useShmop) {
-                    \shmop_write($handle, $packed, 0);
-                } else {
-                    file_put_contents($handle, $packed);
+                $len = strlen($packed);
+                $written = 0;
+                while ($written < $len) {
+                    $n = fwrite($pair[1], substr($packed, $written, 131072));
+                    $written += $n;
                 }
+                fclose($pair[1]);
                 exit(0);
             }
-            $childMap[$pid] = $handle;
+            fclose($pair[1]);
+            $childMap[$pid] = $pair[0];
         }
 
         // Parent processes last chunk while children work
@@ -189,7 +188,7 @@ final class Parser
             $slugBases, $dateIds, $slugCount, $dateCount,
         );
 
-        // We merge the worker results back once they finish (chunked unpacking + skip-zero)
+        // Merge worker results as they finish (read from pipes, chunked unpacking)
         $pending = count($childMap);
         while ($pending > 0) {
             $pid = pcntl_wait($status, WNOHANG);
@@ -197,15 +196,13 @@ final class Parser
                 $pid = pcntl_wait($status);
             }
             if (!isset($childMap[$pid])) continue;
-            $handle = $childMap[$pid];
+            $pipe = $childMap[$pid];
 
-            if ($useShmop) {
-                $data = \shmop_read($handle, 0, $gridSize);
-                \shmop_delete($handle);
-            } else {
-                $data = file_get_contents($handle);
-                unlink($handle);
+            $data = '';
+            while (!feof($pipe)) {
+                $data .= fread($pipe, 131072);
             }
+            fclose($pipe);
 
             for ($pos = 0; $pos < $gridSize; $pos += 16384) {
                 $sz = $gridSize - $pos;
