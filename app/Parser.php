@@ -114,6 +114,54 @@ final class Parser
             }
         }
 
+        // Major lookup alert: we wanna identify slugs by length + 2 char positions
+        // $slugFast[len][char@p1][char@p2] = base, $slugP1/$slugP2 = which positions to check
+        // For unique lengths, $slugFast[len] = base directly (int not array)
+        $byLen = [];
+        foreach ($slugBases as $slug => $base) {
+            $byLen[strlen($slug)][] = [$slug, $base];
+        }
+
+        $slugFast = [];
+        $slugP1 = [];
+        $slugP2 = [];
+
+        foreach ($byLen as $len => $entries) {
+            if (count($entries) === 1) {
+                $slugFast[$len] = $entries[0][1];
+                continue;
+            }
+
+            for ($p1 = 0; $p1 < $len; $p1++) {
+                for ($p2 = $p1 + 1; $p2 < $len; $p2++) {
+                    $keys = [];
+                    $unique = true;
+                    foreach ($entries as [$s, $b]) {
+                        $k = $s[$p1] . $s[$p2];
+                        if (isset($keys[$k])) { $unique = false; break; }
+                        $keys[$k] = true;
+                    }
+                    if ($unique) {
+                        $slugP1[$len] = $p1;
+                        $slugP2[$len] = $p2;
+                        $slugFast[$len] = [];
+                        foreach ($entries as [$s, $b]) {
+                            $slugFast[$len][$s[$p1]][$s[$p2]] = $b;
+                        }
+                        goto nextLen;
+                    }
+                }
+            }
+            // Fallback for lengths needing 3+ positions: keep as string-keyed map
+            $slugP1[$len] = -1;
+            $slugP2[$len] = 0;
+            $slugFast[$len] = [];
+            foreach ($entries as [$s, $b]) {
+                $slugFast[$len][$s] = $b;
+            }
+            nextLen:
+        }
+
         $workers = 8;
 
         // With Appple Silicon stuff we have faster perf cores and slow efficiency cores
@@ -178,7 +226,7 @@ final class Parser
             if ($pid === 0) {
                 $wCounts = $this->parseRange(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
-                    $slugBases, $ymBase, $dayLookup, $slugCount, $dateCount,
+                    $slugFast, $slugP1, $slugP2, $ymBase, $dayLookup, $slugCount, $dateCount,
                 );
                 \file_put_contents($tmpFile, pack('v*', ...$wCounts));
                 exit(0);
@@ -189,7 +237,7 @@ final class Parser
         // Parent processes last chunk while children work
         $counts = $this->parseRange(
             $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
-            $slugBases, $ymBase, $dayLookup, $slugCount, $dateCount,
+            $slugFast, $slugP1, $slugP2, $ymBase, $dayLookup, $slugCount, $dateCount,
         );
 
         // Merge worker results as they finish
@@ -230,7 +278,9 @@ final class Parser
         string $inputPath,
         int $start,
         int $end,
-        array $slugBases,
+        array $slugFast,
+        array $slugP1,
+        array $slugP2,
         array $ymBase,
         array $dayLookup,
         int $slugCount,
@@ -243,11 +293,6 @@ final class Parser
         fseek($fh, $start);
         $bytesLeft = $end - $start;
 
-        // Each line is: "https://stitcher.io/blog/" (25 chars) + slug + "," + date + "T" + time + "\n"
-        // The URL prefix is 25 bytes, the suffix after the comma is always 26 bytes + newline
-        // So from one comma to the next slug start is always 52 bytes
-        $lineFixedSuffix = 52;
-
         while ($bytesLeft > 0) {
             $readSize = $bytesLeft > self::READ_CHUNK ? self::READ_CHUNK : $bytesLeft;
             $buf = fread($fh, $readSize);
@@ -255,11 +300,9 @@ final class Parser
             if ($bufLen === 0) break;
             $bytesLeft -= $bufLen;
 
-            // Find last complete line in this buffer
             $endOfLastLine = strrpos($buf, "\n");
             if ($endOfLastLine === false) break;
 
-            // Seek back to re-read any trailing partial line next iteration
             $overflow = $bufLen - $endOfLastLine - 1;
             if ($overflow > 0) {
                 fseek($fh, -$overflow, SEEK_CUR);
@@ -267,50 +310,35 @@ final class Parser
             }
 
             $cursor = 25;
-            $safeEnd = $endOfLastLine - 960;
+            $safeEnd = $endOfLastLine - 480;
 
-            // 8x unrolled hot loop — each iteration processes 8 lines
-            // Date at $c+3 is "YY-MM-DD": $c+4 = year unit, $c+6/$c+7 = month, $c+9/$c+10 = day
+            // 4x unrolled hot loop
+            // Slug lookup: length → unique base (int) or [char@p1][char@p2] → base
+            // Date lookup: char-indexed year/month/day → dateId
             while ($cursor < $safeEnd) {
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
+                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
 
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
+                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
 
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
+                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
 
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
-
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
-
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
-
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
-
-                $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
+                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
             }
 
-            // Remaining lines that didn't fill a full unrolled batch
             while ($cursor < $endOfLastLine) {
                 $c = strpos($buf, ',', $cursor);
                 if ($c === false || $c >= $endOfLastLine) break;
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
-                $cursor = $c + $lineFixedSuffix;
+                $l = $c - $cursor; $f = $slugFast[$l];
+                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
             }
         }
 
