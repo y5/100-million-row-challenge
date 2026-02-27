@@ -15,6 +15,7 @@ use function fseek;
 use function ftell;
 use function fwrite;
 use function gc_disable;
+use function getmypid;
 use function implode;
 use function ini_set;
 use function pack;
@@ -23,21 +24,20 @@ use function pcntl_wait;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
-use function stream_socket_pair;
 use function strlen;
 use function strpos;
 use function strrpos;
 use function substr;
+use function sys_get_temp_dir;
+use function unlink;
 use function unpack;
 
 use const SEEK_CUR;
-use const STREAM_PF_UNIX;
-use const STREAM_SOCK_STREAM;
 use const WNOHANG;
 
 final class Parser
 {
-    private const int READ_CHUNK = 262_144;
+    private const int READ_CHUNK = 1_048_576;
     private const int PROBE_SIZE = 2_097_152;
 
     public function parse(string $inputPath, string $outputPath): void
@@ -49,22 +49,34 @@ final class Parser
 
         // Map every valid "YY-MM-DD" to a sequential integer
         $dpm = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        $dateIds = [];
         $dateLabels = [];
         $dateCount = 0;
 
+        // Character-indexed date lookup: avoids substr + hash in the hot loop
+        // For years 2020-2026, tens digit is always '2', so units char determines year
+        // $ymBase[yearUnitChar][monthTensChar][monthUnitChar] = cumulative day offset
+        // $dayLookup[dayTensChar][dayUnitChar] = 0-based day
+        $ymBase = [];
+        $dayLookup = [];
+
         for ($year = 2020; $year <= 2026; $year++) {
-            $yy = $year - 2000;
+            $yChar = \chr(($year - 2020) + 48);
+            $ymBase[$yChar] = [];
             for ($m = 0; $m < 12; $m++) {
                 $days = $dpm[$m] + ($m === 1 && $year % 4 === 0 ? 1 : 0);
-                $prefix = sprintf('%d-%02d-', $yy, $m + 1);
+                $mtChar = \chr(\intdiv($m + 1, 10) + 48);
+                $muChar = \chr(($m + 1) % 10 + 48);
+                $ymBase[$yChar][$mtChar][$muChar] = $dateCount;
+                $prefix = sprintf('%d-%02d-', $year - 2000, $m + 1);
                 for ($d = 1; $d <= $days; $d++) {
-                    $key = $prefix . sprintf('%02d', $d);
-                    $dateIds[$key] = $dateCount;
-                    $dateLabels[$dateCount] = $key;
+                    $dateLabels[$dateCount] = $prefix . sprintf('%02d', $d);
                     $dateCount++;
                 }
             }
+        }
+
+        for ($d = 1; $d <= 31; $d++) {
+            $dayLookup[\chr(\intdiv($d, 10) + 48)][\chr($d % 10 + 48)] = $d - 1;
         }
 
         // Probe head of file to discover slugs in first-seen order
@@ -155,40 +167,32 @@ final class Parser
 
         $gridSize = $slugCount * $dateCount * 2;
 
-        // Fork workers, IPC via Unix socket pairs
+        // Fork workers, IPC via temp files (tmpfs on Linux = RAM, no disk I/O)
         $childMap = [];
+        $parentPid = getmypid();
 
         for ($w = 0; $w < $workers - 1; $w++) {
-            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+            $tmpFile = sys_get_temp_dir() . '/p100m_' . $parentPid . '_' . $w;
 
             $pid = pcntl_fork();
             if ($pid === 0) {
-                fclose($pair[0]);
                 $wCounts = $this->parseRange(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
-                    $slugBases, $dateIds, $slugCount, $dateCount,
+                    $slugBases, $ymBase, $dayLookup, $slugCount, $dateCount,
                 );
-                $packed = pack('v*', ...$wCounts);
-                $len = strlen($packed);
-                $written = 0;
-                while ($written < $len) {
-                    $n = fwrite($pair[1], substr($packed, $written, 131072));
-                    $written += $n;
-                }
-                fclose($pair[1]);
+                \file_put_contents($tmpFile, pack('v*', ...$wCounts));
                 exit(0);
             }
-            fclose($pair[1]);
-            $childMap[$pid] = $pair[0];
+            $childMap[$pid] = $tmpFile;
         }
 
         // Parent processes last chunk while children work
         $counts = $this->parseRange(
             $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
-            $slugBases, $dateIds, $slugCount, $dateCount,
+            $slugBases, $ymBase, $dayLookup, $slugCount, $dateCount,
         );
 
-        // Merge worker results as they finish (read from pipes, chunked unpacking)
+        // Merge worker results as they finish
         $pending = count($childMap);
         while ($pending > 0) {
             $pid = pcntl_wait($status, WNOHANG);
@@ -196,13 +200,9 @@ final class Parser
                 $pid = pcntl_wait($status);
             }
             if (!isset($childMap[$pid])) continue;
-            $pipe = $childMap[$pid];
-
-            $data = '';
-            while (!feof($pipe)) {
-                $data .= fread($pipe, 131072);
-            }
-            fclose($pipe);
+            $tmpFile = $childMap[$pid];
+            $data = \file_get_contents($tmpFile);
+            unlink($tmpFile);
 
             for ($pos = 0; $pos < $gridSize; $pos += 16384) {
                 $sz = $gridSize - $pos;
@@ -231,7 +231,8 @@ final class Parser
         int $start,
         int $end,
         array $slugBases,
-        array $dateIds,
+        array $ymBase,
+        array $dayLookup,
         int $slugCount,
         int $dateCount,
     ): array {
@@ -245,7 +246,6 @@ final class Parser
         // Each line is: "https://stitcher.io/blog/" (25 chars) + slug + "," + date + "T" + time + "\n"
         // The URL prefix is 25 bytes, the suffix after the comma is always 26 bytes + newline
         // So from one comma to the next slug start is always 52 bytes
-        $urlPrefixLen = 25;
         $lineFixedSuffix = 52;
 
         while ($bytesLeft > 0) {
@@ -266,41 +266,42 @@ final class Parser
                 $bytesLeft += $overflow;
             }
 
-            $cursor = $urlPrefixLen;
+            $cursor = 25;
             $safeEnd = $endOfLastLine - 960;
 
             // 8x unrolled hot loop — each iteration processes 8 lines
+            // Date at $c+3 is "YY-MM-DD": $c+4 = year unit, $c+6/$c+7 = month, $c+9/$c+10 = day
             while ($cursor < $safeEnd) {
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
 
                 $c = strpos($buf, ',', $cursor);
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
             }
 
@@ -308,7 +309,7 @@ final class Parser
             while ($cursor < $endOfLastLine) {
                 $c = strpos($buf, ',', $cursor);
                 if ($c === false || $c >= $endOfLastLine) break;
-                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + $lineFixedSuffix;
             }
         }
