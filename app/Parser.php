@@ -107,35 +107,67 @@ final class Parser
             }
         }
 
-        // We do some funny worker scaling business
-        // $cpus = (int) (@\shell_exec('nproc 2>/dev/null') ?: @\shell_exec('sysctl -n hw.ncpu 2>/dev/null') ?: 8);
-        // $workers = (int) \max(8, \ceil($cpus * 1.25));
         $workers = 8;
 
-        // Asymmetric split: Parent process gets ~5% of work so it finished early and starts merging results
+        // With Appple Silicon stuff we have faster perf cores and slow efficiency cores
+        // The perf cores should get bigger chunks so they finish at roughly the same time
+        // Mac fills perf cores first, so the first forks get bigger chunks
+        $perfCores = (int) (@\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null') ?: 0);
+        $effCores = (int) (@\shell_exec('sysctl -n hw.perflevel1.logicalcpu 2>/dev/null') ?: 0);
+
         $childShare = (int) ($fileSize * 0.95);
-        $boundaries = [0];
+        $children = $workers - 1;
         $bh = fopen($inputPath, 'rb');
-        for ($i = 1; $i < $workers - 1; $i++) {
-            fseek($bh, (int) ($childShare * $i / ($workers - 1)));
+        $boundaries = [0];
+
+        if ($perfCores > 0 && $effCores > 0) {
+            // We are on Apple silicon
+            // parent gets a perf slot, children get ($perfCores - 1) perf cores + $effCores efficiency cores
+            $perfChildren = $perfCores - 1;
+            $effChildren = $children - $perfChildren;
+            // Perf is like ~1.7x faster than eff, so we weight the chunks accordingly
+            $perfChunk = (int) ($childShare / ($perfChildren + $effChildren * 0.6));
+            $effChunk = (int) ($perfChunk * 0.6);
+
+            $offset = 0;
+            // We spawn the perf core children
+            for ($i = 0; $i < $perfChildren; $i++) {
+                $offset += $perfChunk;
+                fseek($bh, $offset);
+                fgets($bh);
+                $boundaries[] = ftell($bh);
+            }
+            // Then our remaining efficiency cores
+            for ($i = 0; $i < $effChildren; $i++) {
+                $offset += $effChunk;
+                fseek($bh, $offset);
+                fgets($bh);
+                $boundaries[] = ftell($bh);
+            }
+        } else {
+            // We are on Linux so we do normal weighting
+            for ($i = 1; $i < $children; $i++) {
+                fseek($bh, (int) ($childShare * $i / $children));
+                fgets($bh);
+                $boundaries[] = ftell($bh);
+            }
+            fseek($bh, $childShare);
             fgets($bh);
             $boundaries[] = ftell($bh);
         }
-        fseek($bh, $childShare);
-        fgets($bh);
-        $boundaries[] = ftell($bh);
         fclose($bh);
         $boundaries[] = $fileSize;
 
         $gridSize = $slugCount * $dateCount * 2;
 
-        // Fork workers, shmopping it hardcore
+        // Fork workers, IPC via shmop (or temp files as fallback)
+        $useShmop = \function_exists('shmop_open');
         $childMap = [];
-        $tmpDir = '';
-        $myPid = 0;
 
         for ($w = 0; $w < $workers - 1; $w++) {
-            $handle = \shmop_open(0, 'c', 0600, $gridSize);
+            $handle = $useShmop
+                ? \shmop_open(0, 'c', 0600, $gridSize)
+                : sys_get_temp_dir() . '/p100m_' . getmypid() . '_' . $w;
 
             $pid = pcntl_fork();
             if ($pid === 0) {
@@ -144,7 +176,11 @@ final class Parser
                     $slugBases, $dateIds, $slugCount, $dateCount,
                 );
                 $packed = pack('v*', ...$wCounts);
-                \shmop_write($handle, $packed, 0);
+                if ($useShmop) {
+                    \shmop_write($handle, $packed, 0);
+                } else {
+                    file_put_contents($handle, $packed);
+                }
                 exit(0);
             }
             $childMap[$pid] = $handle;
@@ -166,8 +202,13 @@ final class Parser
             if (!isset($childMap[$pid])) continue;
             $handle = $childMap[$pid];
 
-            $data = \shmop_read($handle, 0, $gridSize);
-            \shmop_delete($handle);
+            if ($useShmop) {
+                $data = \shmop_read($handle, 0, $gridSize);
+                \shmop_delete($handle);
+            } else {
+                $data = file_get_contents($handle);
+                unlink($handle);
+            }
 
             for ($pos = 0; $pos < $gridSize; $pos += 16384) {
                 $sz = $gridSize - $pos;
