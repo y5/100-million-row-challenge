@@ -37,7 +37,7 @@ use const WNOHANG;
 
 final class Parser
 {
-    private const int READ_CHUNK = 1_048_576;
+    private const int READ_CHUNK = 2_097_152;
     private const int PROBE_SIZE = 2_097_152;
 
     public function parse(string $inputPath, string $outputPath): void
@@ -125,10 +125,16 @@ final class Parser
         $slugFast = [];
         $slugP1 = [];
         $slugP2 = [];
+        $slugP3 = [];  // == p2 for 2-position lengths (branchless), distinct for 3-position
 
         foreach ($byLen as $len => $entries) {
             if (count($entries) === 1) {
-                $slugFast[$len] = $entries[0][1];
+                // Store as 3-level lookup (p3 == p2 so third key == second key)
+                $slugP1[$len] = 0;
+                $slugP2[$len] = 1;
+                $slugP3[$len] = 1;
+                $s = $entries[0][0];
+                $slugFast[$len] = [$s[0] => [$s[1] => [$s[1] => $entries[0][1]]]];
                 continue;
             }
 
@@ -144,21 +150,42 @@ final class Parser
                     if ($unique) {
                         $slugP1[$len] = $p1;
                         $slugP2[$len] = $p2;
+                        $slugP3[$len] = $p2; // p3 == p2 → third key == second key (branchless 3-level)
                         $slugFast[$len] = [];
                         foreach ($entries as [$s, $b]) {
-                            $slugFast[$len][$s[$p1]][$s[$p2]] = $b;
+                            $slugFast[$len][$s[$p1]][$s[$p2]][$s[$p2]] = $b;
                         }
                         goto nextLen;
                     }
                 }
             }
-            // Fallback for lengths needing 3+ positions: keep as string-keyed map
-            $slugP1[$len] = -1;
-            $slugP2[$len] = 0;
-            $slugFast[$len] = [];
-            foreach ($entries as [$s, $b]) {
-                $slugFast[$len][$s] = $b;
+            // Fallback for lengths needing 3+ positions: use 3-position lookup
+            // Find best 3-position discriminator
+            for ($p1 = 0; $p1 < $len; $p1++) {
+                for ($p2 = $p1 + 1; $p2 < $len; $p2++) {
+                    for ($p3 = $p2 + 1; $p3 < $len; $p3++) {
+                        $keys = [];
+                        $unique = true;
+                        foreach ($entries as [$s, $b]) {
+                            $k = $s[$p1] . $s[$p2] . $s[$p3];
+                            if (isset($keys[$k])) { $unique = false; break; }
+                            $keys[$k] = true;
+                        }
+                        if ($unique) {
+                            $slugP1[$len] = $p1;
+                            $slugP2[$len] = $p2;
+                            $slugP3[$len] = $p3;
+                            $slugFast[$len] = [];
+                            foreach ($entries as [$s, $b]) {
+                                $slugFast[$len][$s[$p1]][$s[$p2]][$s[$p3]] = $b;
+                            }
+                            goto nextLen;
+                        }
+                    }
+                }
             }
+            // Should never reach here with known data — all lengths should resolve with ≤3 positions
+            throw new \RuntimeException("Cannot find 3-position discriminator for slug length $len");
             nextLen:
         }
 
@@ -226,7 +253,7 @@ final class Parser
             if ($pid === 0) {
                 $wCounts = $this->parseRange(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
-                    $slugFast, $slugP1, $slugP2, $ymBase, $dayLookup, $slugCount, $dateCount,
+                    $slugFast, $slugP1, $slugP2, $slugP3, $ymBase, $dayLookup, $slugCount, $dateCount,
                 );
                 \file_put_contents($tmpFile, pack('v*', ...$wCounts));
                 exit(0);
@@ -237,7 +264,7 @@ final class Parser
         // Parent processes last chunk while children work
         $counts = $this->parseRange(
             $inputPath, $boundaries[$workers - 1], $boundaries[$workers],
-            $slugFast, $slugP1, $slugP2, $ymBase, $dayLookup, $slugCount, $dateCount,
+            $slugFast, $slugP1, $slugP2, $slugP3, $ymBase, $dayLookup, $slugCount, $dateCount,
         );
 
         // Merge worker results as they finish
@@ -281,6 +308,7 @@ final class Parser
         array $slugFast,
         array $slugP1,
         array $slugP2,
+        array $slugP3,
         array $ymBase,
         array $dayLookup,
         int $slugCount,
@@ -310,34 +338,48 @@ final class Parser
             }
 
             $cursor = 25;
-            $safeEnd = $endOfLastLine - 480;
+            $safeEnd = $endOfLastLine - 960;
 
-            // 4x unrolled hot loop
-            // Slug lookup: length → unique base (int) or [char@p1][char@p2] → base
-            // Date lookup: char-indexed year/month/day → dateId
+            // 8x unrolled hot loop — uniform 3-level slug lookup (branchless)
             while ($cursor < $safeEnd) {
-                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
-                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + 52;
 
-                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
-                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + 52;
 
-                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
-                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + 52;
 
-                $c = strpos($buf, ',', $cursor); $l = $c - $cursor; $f = $slugFast[$l];
-                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
+
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
+
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
+
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $cursor = $c + 52;
+
+                $c = strpos($buf, ',', $cursor); $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + 52;
             }
 
             while ($cursor < $endOfLastLine) {
                 $c = strpos($buf, ',', $cursor);
                 if ($c === false || $c >= $endOfLastLine) break;
-                $l = $c - $cursor; $f = $slugFast[$l];
-                $counts[(\is_int($f) ? $f : ($slugP1[$l] >= 0 ? $f[$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]] : $f[substr($buf, $cursor, $l)])) + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
+                $l = $c - $cursor;
+                $counts[$slugFast[$l][$buf[$cursor + $slugP1[$l]]][$buf[$cursor + $slugP2[$l]]][$buf[$cursor + $slugP3[$l]]] + $ymBase[$buf[$c + 4]][$buf[$c + 6]][$buf[$c + 7]] + $dayLookup[$buf[$c + 9]][$buf[$c + 10]]]++;
                 $cursor = $c + 52;
             }
         }
