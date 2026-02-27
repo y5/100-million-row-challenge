@@ -225,6 +225,8 @@ final class Parser
     }
 
     /**
+     * Parse a byte range of the input file and return a flat counts array.
+     *
      * @return int[]
      */
     private function parseRange(
@@ -236,71 +238,81 @@ final class Parser
         int $slugCount,
         int $dateCount,
     ): array {
-        $counts = array_fill(0, $slugCount * $dateCount, 0);
+        $totalCells = $slugCount * $dateCount;
+        $counts = array_fill(0, $totalCells, 0);
         $fh = fopen($inputPath, 'rb');
         stream_set_read_buffer($fh, 0);
         fseek($fh, $start);
-        $remaining = $end - $start;
+        $bytesLeft = $end - $start;
 
-        while ($remaining > 0) {
-            $toRead = $remaining > self::READ_CHUNK ? self::READ_CHUNK : $remaining;
-            $chunk = fread($fh, $toRead);
-            $chunkLen = strlen($chunk);
-            if ($chunkLen === 0) break;
-            $remaining -= $chunkLen;
+        // Each line is: "https://stitcher.io/blog/" (25 chars) + slug + "," + date + "T" + time + "\n"
+        // The URL prefix is 25 bytes, the suffix after the comma is always 26 bytes + newline
+        // So from one comma to the next slug start is always 52 bytes
+        $urlPrefixLen = 25;
+        $lineFixedSuffix = 52;
 
-            $lastNl = strrpos($chunk, "\n");
-            if ($lastNl === false) break;
+        while ($bytesLeft > 0) {
+            $readSize = $bytesLeft > self::READ_CHUNK ? self::READ_CHUNK : $bytesLeft;
+            $buf = fread($fh, $readSize);
+            $bufLen = strlen($buf);
+            if ($bufLen === 0) break;
+            $bytesLeft -= $bufLen;
 
-            $tail = $chunkLen - $lastNl - 1;
-            if ($tail > 0) {
-                fseek($fh, -$tail, SEEK_CUR);
-                $remaining += $tail;
+            // Find last complete line in this buffer
+            $endOfLastLine = strrpos($buf, "\n");
+            if ($endOfLastLine === false) break;
+
+            // Seek back to re-read any trailing partial line next iteration
+            $overflow = $bufLen - $endOfLastLine - 1;
+            if ($overflow > 0) {
+                fseek($fh, -$overflow, SEEK_CUR);
+                $bytesLeft += $overflow;
             }
 
-            // Manual unrolling of loop because idk?
-            $p = 25;
-            $fence = $lastNl - 960;
+            $cursor = $urlPrefixLen;
+            $safeEnd = $endOfLastLine - 960;
 
-            while ($p < $fence) {
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+            // 8x unrolled hot loop — each iteration processes 8 lines
+            while ($cursor < $safeEnd) {
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
 
-                $sep = strpos($chunk, ',', $p);
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+                $c = strpos($buf, ',', $cursor);
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
             }
 
-            while ($p < $lastNl) {
-                $sep = strpos($chunk, ',', $p);
-                if ($sep === false || $sep >= $lastNl) break;
-                $counts[$slugBases[substr($chunk, $p, $sep - $p)] + $dateIds[substr($chunk, $sep + 3, 8)]]++;
-                $p = $sep + 52;
+            // Remaining lines that didn't fill a full unrolled batch
+            while ($cursor < $endOfLastLine) {
+                $c = strpos($buf, ',', $cursor);
+                if ($c === false || $c >= $endOfLastLine) break;
+                $counts[$slugBases[substr($buf, $cursor, $c - $cursor)] + $dateIds[substr($buf, $c + 3, 8)]]++;
+                $cursor = $c + $lineFixedSuffix;
             }
         }
 
@@ -317,39 +329,45 @@ final class Parser
         int $dateCount,
     ): void {
         $out = fopen($outputPath, 'wb');
-        stream_set_write_buffer($out, 1_048_576);
-        fwrite($out, '{');
+        stream_set_write_buffer($out, 262_144);
 
-        $datePfx = [];
-        for ($d = 0; $d < $dateCount; $d++) {
-            $datePfx[$d] = '        "20' . $dateLabels[$d] . '": ';
-        }
-
+        // Build the full JSON into a buffer and flush in big chunks
+        $buf = '{';
         $slugCount = count($slugLabels);
-        $slugHdr = [];
-        for ($s = 0; $s < $slugCount; $s++) {
-            $slugHdr[$s] = '"\\/blog\\/' . str_replace('/', '\\/', $slugLabels[$s]) . '"';
-        }
-
-        $first = true;
+        $sep = '';
 
         for ($s = 0; $s < $slugCount; $s++) {
             $base = $s * $dateCount;
-            $parts = [];
 
+            // Scan for any non-zero date in this slug
+            $hasAny = false;
+            for ($d = 0; $d < $dateCount; $d++) {
+                if ($counts[$base + $d] !== 0) { $hasAny = true; break; }
+            }
+            if (!$hasAny) continue;
+
+            $escapedSlug = str_replace('/', '\\/', $slugLabels[$s]);
+            $buf .= $sep . "\n    \"\\/blog\\/" . $escapedSlug . "\": {\n";
+            $sep = ',';
+
+            $innerSep = '';
             for ($d = 0; $d < $dateCount; $d++) {
                 $cnt = $counts[$base + $d];
                 if ($cnt === 0) continue;
-                $parts[] = $datePfx[$d] . $cnt;
+                $buf .= $innerSep . '        "20' . $dateLabels[$d] . '": ' . $cnt;
+                $innerSep = ",\n";
             }
+            $buf .= "\n    }";
 
-            if (!$parts) continue;
-
-            fwrite($out, ($first ? '' : ',') . "\n    " . $slugHdr[$s] . ": {\n" . implode(",\n", $parts) . "\n    }");
-            $first = false;
+            // Flush when buffer gets large
+            if (strlen($buf) > 131_072) {
+                fwrite($out, $buf);
+                $buf = '';
+            }
         }
 
-        fwrite($out, "\n}");
+        $buf .= "\n}";
+        fwrite($out, $buf);
         fclose($out);
     }
 }
